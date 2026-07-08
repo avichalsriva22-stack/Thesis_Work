@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Config>
+  <Param name="InputFile" value="C:\Users\hp\Downloads\APPROACH 2\test_out.xodr"/>
+  <CheckerBundle application="xodrBundle">
+    <Param name="resultFile" value="C:\Users\hp\Downloads\APPROACH 2\test_out_qc_result.xml"/>
+  </CheckerBundle>
+</Config>

@@ -1,0 +1,9 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+xodr_pipeline/.pytest_cache/
+xodr_pipeline/src/output/
+xodr_pipeline/src/api/__pycache__/
+*.xodr
+test_log.txt
