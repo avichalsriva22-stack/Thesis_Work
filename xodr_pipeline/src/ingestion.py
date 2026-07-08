@@ -37,11 +37,12 @@ def fetch_osm_data(bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
     min_lon, min_lat, max_lon, max_lat = bbox
     
     # Overpass bounding box is (min_lat, min_lon, max_lat, max_lon)
+    # Filter ways to only pull drivable highway classes (excluding footways, railways, etc.)
     query = f"""
     [out:json][timeout:25];
     (
       node({min_lat},{min_lon},{max_lat},{max_lon});
-      way({min_lat},{min_lon},{max_lat},{max_lon});
+      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified|service|living_street|unknown)$"]({min_lat},{min_lon},{max_lat},{max_lon});
     );
     out body;
     """
@@ -121,6 +122,11 @@ def fetch_overture_data(bbox: Tuple[float, float, float, float]) -> Dict[str, An
         traceback.print_exc()
         raise RuntimeError(f"Failed to initialize Overture segment reader: {e}")
         
+    ALLOWED_ROAD_CLASSES = {
+        'motorway', 'trunk', 'primary', 'secondary', 'tertiary',
+        'residential', 'unclassified', 'service', 'living_street', 'unknown'
+    }
+
     segments = []
     if reader is not None:
         try:
@@ -129,6 +135,11 @@ def fetch_overture_data(bbox: Tuple[float, float, float, float]) -> Dict[str, An
                     geom = row.get("geometry")
                     if geom:
                         try:
+                            # ── Semantic Filter: only keep drivable road classes ──
+                            road_class = row.get('class')
+                            if road_class not in ALLOWED_ROAD_CLASSES:
+                                continue
+                                
                             ls = shapely.wkb.loads(geom)
                             if ls.geom_type == 'LineString':
                                 coords = list(ls.coords)
