@@ -235,9 +235,15 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
                             connecting_road=phys_road.id,
                             contact_point=xodr.ContactPoint.start,
                         )
-                        for ll in conn.lane_links:
-                            jconn.add_lanelink(ll.from_lane, ll.to_lane)
+                        # The connecting road only has right lanes (-1, -2, etc)
+                        # So we must map the incoming lanes to those sequentially
+                        for i, ll in enumerate(conn.lane_links):
+                            jconn.add_lanelink(ll.from_lane, -(i + 1))
                         junction.add_connection(jconn)
+                        
+                        # Mark the physical road as belonging to this junction
+                        phys_road.junction = str(numeric_jid)
+                        
                         conn_count += 1
                     except Exception as e:
                         print(
@@ -320,7 +326,83 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
             injected += 1
         print(f"[Assembly] planView injection complete: {injected} injected, {skipped} skipped (no primitives).")
 
-        # Re-serialize with injected planViews
+        connecting_road_ids = set()
+        print(f"[Assembly] Post-processing laneLinks for connecting roads...")
+        for j_id, j_node in graph.junctions.items():
+            numeric_jid = abs(hash(j_id)) % (10 ** 8)
+            for conn in j_node.connections:
+                if not conn.physical_road_id:
+                    continue
+                connecting_road_ids.add(conn.physical_road_id)
+                numeric_conn_id = abs(hash(conn.physical_road_id)) % (10 ** 8)
+                conn_road_el = root.find(f'.//road[@id="{numeric_conn_id}"]')
+                if conn_road_el is not None:
+                    # Fix the junction attribute on the connecting road
+                    conn_road_el.set('junction', str(numeric_jid))
+                    
+                    # We map from connecting road lanes (-(i+1)) to outgoing road lanes (ll.to_lane)
+                    for i, ll in enumerate(conn.lane_links):
+                        l_id_str = str(-(i + 1))
+                        lane_el = conn_road_el.find(f'.//lane[@id="{l_id_str}"]')
+                        if lane_el is not None:
+                            link_el = lane_el.find('link')
+                            if link_el is None:
+                                link_el = ET.SubElement(lane_el, 'link')
+                                
+                            succ_el = link_el.find('successor')
+                            if succ_el is None:
+                                ET.SubElement(link_el, 'successor', {'id': str(ll.to_lane)})
+                            else:
+                                succ_el.set('id', str(ll.to_lane))
+                                
+                            pred_el = link_el.find('predecessor')
+                            if pred_el is None:
+                                ET.SubElement(link_el, 'predecessor', {'id': str(ll.from_lane)})
+                            else:
+                                pred_el.set('id', str(ll.from_lane))
+
+        print(f"[Assembly] Post-processing laneLinks for direct road connections...")
+        for road_id, road_node in graph.roads.items():
+            # Skip connecting roads (they belong to a junction and are handled above)
+            if road_id in connecting_road_ids:
+                continue
+                
+            numeric_id = abs(hash(road_id)) % (10 ** 8)
+            road_el = root.find(f'.//road[@id="{numeric_id}"]')
+            if road_el is not None:
+                sem = road_node.lane_semantics
+                lanes = []
+                if sem:
+                    for i in range(1, sem.n_forward + 1):
+                        lanes.append(-i)
+                    for i in range(1, sem.n_backward + 1):
+                        lanes.append(i)
+                else:
+                    lanes = [-1]
+
+                for l_id in lanes:
+                    l_id_str = str(l_id)
+                    lane_el = road_el.find(f'.//lane[@id="{l_id_str}"]')
+                    if lane_el is not None:
+                        link_el = lane_el.find('link')
+                        if link_el is None:
+                            link_el = ET.SubElement(lane_el, 'link')
+                            
+                        if road_node.predecessor and road_node.predecessor.element_type == "road":
+                            pred_el = link_el.find('predecessor')
+                            if pred_el is None:
+                                ET.SubElement(link_el, 'predecessor', {'id': l_id_str})
+                            else:
+                                pred_el.set('id', l_id_str)
+                                
+                        if road_node.successor and road_node.successor.element_type == "road":
+                            succ_el = link_el.find('successor')
+                            if succ_el is None:
+                                ET.SubElement(link_el, 'successor', {'id': l_id_str})
+                            else:
+                                succ_el.set('id', l_id_str)
+
+        # Re-serialize with injected planViews and laneLinks
         xml_bytes = ET.tostring(root, encoding='utf-8', xml_declaration=True)
         xml_string = xml_bytes.decode('utf-8')
         print(f"[Assembly] Successfully serialized OpenDRIVE XML string. Size: {len(xml_string)} bytes.")
