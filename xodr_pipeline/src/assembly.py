@@ -3,50 +3,10 @@ from scenariogeneration.xodr import Orientation, ElementType, ContactPoint, Dire
 from typing import Dict
 import xml.etree.ElementTree as ET
 import traceback
-from .models import RoadNode, LinePrimitive, ArcPrimitive, LaneSemantics
+from .models import RoadNode, LinePrimitive, ArcPrimitive, SpiralPrimitive, LaneSemantics
 from .topology import RoadGraph
 
 
-def _build_fallback_junction(
-    j_id: str,
-    numeric_jid: int,
-    j_node,
-    xodr_roads: Dict[str, xodr.Road],
-) -> xodr.Junction:
-    """
-    Build a standard (non-direct) xodr.Junction for junctions where
-    DirectJunctionCreator fails due to lane-count mismatches.
-    """
-    junction = xodr.Junction(name=f"Junc_{j_id[:6]}", id=numeric_jid)
-    conn_count = 0
-    for conn in j_node.connections:
-        inc_road = xodr_roads.get(conn.incoming_road)
-        out_road = xodr_roads.get(conn.connecting_road)
-        if inc_road is None or out_road is None:
-            continue
-        try:
-            contact = (
-                xodr.ContactPoint.start
-                if conn.contact_point == "start"
-                else xodr.ContactPoint.end
-            )
-            jconn = xodr.Connection(
-                incoming_road=inc_road.id,
-                connecting_road=out_road.id,
-                contact_point=contact,
-            )
-            junction.add_connection(jconn)
-            conn_count += 1
-        except Exception as e:
-            print(
-                f"[Assembly] Warning: Fallback junction connection "
-                f"'{conn.incoming_road}'->'{conn.connecting_road}' failed: {e}"
-            )
-    print(
-        f"[Assembly] Fallback junction '{j_id}' (ID: {numeric_jid}) "
-        f"assembled with {conn_count} connections."
-    )
-    return junction
 
 
 def _build_planview_xml(primitives: list) -> ET.Element:
@@ -73,6 +33,10 @@ def _build_planview_xml(primitives: list) -> ET.Element:
         elif isinstance(prim, ArcPrimitive):
             arc_el = ET.SubElement(geom, 'arc')
             arc_el.set('curvature', f"{prim.curvature:.8f}")
+        elif isinstance(prim, SpiralPrimitive):
+            sp = ET.SubElement(geom, 'spiral')
+            sp.set('curvStart', f"{prim.curvature_start:.8f}")
+            sp.set('curvEnd', f"{prim.curvature_end:.8f}")
     return pv
 
 
@@ -188,6 +152,12 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
             # Create Road
             road = xodr.Road(numeric_id, planview, lanes, name=f"Road_{road_id[:6]}")
             
+            if road_id.startswith("junc_"):
+                parts = road_id.split("_")
+                if len(parts) >= 4:
+                    j_id = parts[1]
+                    road.junction = abs(hash(j_id)) % (10 ** 8)
+            
             # 2. Add Signals (Phase 3)
             for sig in road_node.signals:
                 if sig.orientation == "+":
@@ -228,68 +198,63 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
                 contact = ContactPoint.start if link.contact_point == "start" else ContactPoint.end
                 elem_id = abs(hash(link.element_id)) % (10 ** 8)
                 elem_type = ElementType.junction if link.element_type == "junction" else ElementType.road
-                xodr_road.add_predecessor(elem_type, elem_id, contact)
+                if elem_type == ElementType.junction:
+                    xodr_road.add_predecessor(elem_type, elem_id)
+                else:
+                    xodr_road.add_predecessor(elem_type, elem_id, contact)
                 
             if road_node.successor:
                 link = road_node.successor
                 contact = ContactPoint.start if link.contact_point == "start" else ContactPoint.end
                 elem_id = abs(hash(link.element_id)) % (10 ** 8)
                 elem_type = ElementType.junction if link.element_type == "junction" else ElementType.road
-                xodr_road.add_successor(elem_type, elem_id, contact)
+                if elem_type == ElementType.junction:
+                    xodr_road.add_successor(elem_type, elem_id)
+                else:
+                    xodr_road.add_successor(elem_type, elem_id, contact)
         except Exception as e:
             print(f"[Assembly] Warning: Failed to wire initial links for road '{road_id}': {e}")
 
     valid_junctions = set()
-    # 4. Build Junctions — DirectJunctionCreator with fallback to standard Junction
+    # 4. Build Junctions — common Junctions with physical connecting roads
     for j_id, j_node in graph.junctions.items():
         try:
             numeric_jid = abs(hash(j_id)) % (10 ** 8)
-            dj = DirectJunctionCreator(id=numeric_jid, name=f"Junc_{j_id[:6]}")
+            junction = xodr.Junction(name=f"Junc_{j_id[:6]}", id=numeric_jid)
+            conn_count = 0
 
-            direct_ok = 0
-            direct_fail = 0
             for conn in j_node.connections:
+                if not conn.physical_road_id:
+                    continue
                 inc_road = xodr_roads.get(conn.incoming_road)
-                out_road = xodr_roads.get(conn.connecting_road)
-                if inc_road and out_road:
+                phys_road = xodr_roads.get(conn.physical_road_id)
+                if inc_road and phys_road:
                     try:
-                        dj.add_connection(inc_road, out_road)
-                        direct_ok += 1
+                        jconn = xodr.Connection(
+                            incoming_road=inc_road.id,
+                            connecting_road=phys_road.id,
+                            contact_point=xodr.ContactPoint.start,
+                        )
+                        for ll in conn.lane_links:
+                            jconn.add_lanelink(ll.from_lane, ll.to_lane)
+                        junction.add_connection(jconn)
+                        conn_count += 1
                     except Exception as e:
-                        direct_fail += 1
                         print(
-                            f"[Assembly] Warning: DirectJunction link "
-                            f"'{conn.incoming_road}'->'{conn.connecting_road}' "
+                            f"[Assembly] Warning: Junction link "
+                            f"'{conn.incoming_road}'->'{conn.physical_road_id}' "
                             f"in junction '{j_id}': {e}"
                         )
-
-            if len(dj.junction.connections) > 0:
-                # DirectJunctionCreator succeeded — use it
-                odr.add_junction(dj.junction)
+            
+            if conn_count > 0:
+                odr.add_junction(junction)
                 valid_junctions.add(j_id)
                 print(
-                    f"[Assembly] DirectJunction '{j_id}' (ID: {numeric_jid}) — "
-                    f"{direct_ok} ok, {direct_fail} failed."
+                    f"[Assembly] Junction '{j_id}' (ID: {numeric_jid}) "
+                    f"assembled with {conn_count} connections."
                 )
-            elif direct_fail > 0 or direct_ok == 0:
-                # All direct connections failed; fall back to standard Junction
-                print(
-                    f"[Assembly] Warning: DirectJunctionCreator produced 0 connections "
-                    f"for '{j_id}'. Trying standard Junction fallback..."
-                )
-                fb_junction = _build_fallback_junction(
-                    j_id, numeric_jid, j_node, xodr_roads
-                )
-                if fb_junction.connections:
-                    odr.add_junction(fb_junction)
-                    valid_junctions.add(j_id)
-                else:
-                    print(
-                        f"[Assembly] Warning: Junction '{j_id}' has 0 connections "
-                        f"even after fallback — skipping entirely."
-                    )
             else:
-                print(f"[Assembly] Warning: Junction '{j_id}' — no roads to connect.")
+                print(f"[Assembly] Warning: Junction '{j_id}' — no physical roads to connect.")
         except Exception as e:
             print(f"[Assembly] ERROR: Failed to assemble junction '{j_id}': {e}")
             traceback.print_exc()

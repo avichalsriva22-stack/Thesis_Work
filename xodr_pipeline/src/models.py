@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from shapely.geometry import Point, LineString
 
 # --- Phase 1: Anchored Data Models ---
@@ -65,7 +65,7 @@ class ArcPrimitive(GeometricPrimitive):
     curvature: float
 
 @dataclass
-class ClothoidPrimitive(GeometricPrimitive):
+class SpiralPrimitive(GeometricPrimitive):
     curvature_start: float
     curvature_end: float
 
@@ -110,12 +110,21 @@ class RoadNode:
     lane_semantics: Optional[LaneSemantics] = None
 
 @dataclass
+class LaneLink:
+    from_lane: int
+    to_lane: int
+
+@dataclass
 class JunctionConnection:
     incoming_road: str
     connecting_road: str
     contact_point: str
+    lane_links: List["LaneLink"] = field(default_factory=list)
+    turn_angle_deg: float = 0.0
+    physical_road_id: Optional[str] = None
 
 @dataclass
 class JunctionNode:
-    id: str # Will map to Overture connector id
+    id: str # Will map to OSM node id
+    connected_roads: List[Tuple[str, str]] = field(default_factory=list) # List of (seg_id, contact_point)
     connections: List[JunctionConnection] = field(default_factory=list)

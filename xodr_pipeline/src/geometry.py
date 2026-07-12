@@ -6,8 +6,12 @@ from typing import List
 from shapely.geometry import LineString
 
 from .models import (
-    AnchoredOvertureSegment, PlanViewGeometry, PlanViewPoint,
-    LinePrimitive, ArcPrimitive, ClothoidPrimitive
+    AnchoredOvertureSegment,
+    PlanViewGeometry,
+    PlanViewPoint,
+    LinePrimitive,
+    ArcPrimitive,
+    SpiralPrimitive,
 )
 
 

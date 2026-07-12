@@ -86,7 +86,11 @@ def run_pipeline(
     print(f"\n[Phase 3] Generating continuous planview splines and road topology...")
     phase_start = time.time()
     try:
-        from .topology import build_topology
+        from .topology import build_topology, split_segments_at_connectors
+        
+        # Split continuous segments at intersections
+        overture_anchored['segments'] = split_segments_at_connectors(overture_anchored['segments'])
+        
         graph = build_topology(overture_anchored['segments'], overture_anchored['connectors'])
         print(f"[Phase 3] Topology & geometry fit completed in {time.time() - phase_start:.2f} seconds.")
     except Exception as e:
@@ -101,7 +105,15 @@ def run_pipeline(
         from .enrichment import assign_signals_to_roads, assign_lane_semantics
         assign_signals_to_roads(osm_anchored['nodes'], graph.roads, overture_anchored['segments'])
         assign_lane_semantics(osm_anchored['ways'], graph.roads, overture_anchored['segments'])
-        print(f"[Phase 4] Semantic enrichment completed in {time.time() - phase_start:.2f} seconds.")
+        
+        from .topology import resolve_junction_lane_connections
+        resolve_junction_lane_connections(graph)
+        
+        from .junction_geometry import build_junction_connecting_roads
+        connecting_roads = build_junction_connecting_roads(graph)
+        graph.roads.update(connecting_roads)
+        
+        print(f"[Phase 4] Semantic enrichment and lane resolution completed in {time.time() - phase_start:.2f} seconds.")
     except Exception as e:
         print(f"\n[ERROR] Pipeline failed in Phase 4 (Semantic Enrichment): {e}")
         traceback.print_exc()
