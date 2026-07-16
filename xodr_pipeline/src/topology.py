@@ -174,6 +174,20 @@ def _wire_direct_connection(graph: RoadGraph, seg_a: Dict, seg_b: Dict, conn_id:
     else:
         graph.roads[b_id].successor = link_to_a
 
+def _primitive_end_pose(p: "GeometricPrimitive") -> tuple[float, float, float]:
+    from .models import ArcPrimitive
+    if isinstance(p, ArcPrimitive):
+        if abs(p.curvature) > 1e-6:
+            end_hdg = (p.heading + p.length * p.curvature) % (2 * math.pi)
+            x = p.x + (math.sin(end_hdg) - math.sin(p.heading)) / p.curvature
+            y = p.y - (math.cos(end_hdg) - math.cos(p.heading)) / p.curvature
+            return x, y, end_hdg
+    # Fallback for LinePrimitive or near-zero curvature
+    end_hdg = p.heading % (2 * math.pi)
+    x = p.x + p.length * math.cos(end_hdg)
+    y = p.y + p.length * math.sin(end_hdg)
+    return x, y, end_hdg
+
 def _heading_at_connector(road: "RoadNode", contact: str) -> float:
     """
     Returns the direction of travel (radians) at the point where `road`
@@ -189,19 +203,24 @@ def _heading_at_connector(road: "RoadNode", contact: str) -> float:
     else:
         # Road arrives at the junction at its end; flip 180 deg to point
         # away from the junction, back along the road.
-        return (prims[-1].heading + math.pi) % (2 * math.pi)
+        _, _, hdg = _primitive_end_pose(prims[-1])
+        return (hdg + math.pi) % (2 * math.pi)
 
-def _endpoint_xy(road: "RoadNode", contact: str) -> tuple[float, float]:
+def _endpoint_xy(road: "RoadNode", contact: str, lateral_offset: float = 0.0) -> tuple[float, float]:
     prims = road.geometry.primitives
     if contact == "start":
         p = prims[0]
-        return (p.x, p.y)
+        # Normal vector pointing left is heading + pi/2
+        x = p.x + lateral_offset * math.cos(p.heading + math.pi/2)
+        y = p.y + lateral_offset * math.sin(p.heading + math.pi/2)
+        return (x, y)
     else:
         p = prims[-1]
-        end_x = p.x + p.length * math.cos(p.heading)
-        end_y = p.y + p.length * math.sin(p.heading)
-        return (end_x, end_y)
-
+        x, y, hdg = _primitive_end_pose(p)
+        # Normal vector pointing left is heading + pi/2
+        x += lateral_offset * math.cos(hdg + math.pi/2)
+        y += lateral_offset * math.sin(hdg + math.pi/2)
+        return (x, y)
 
 def _heading_into_junction(road: "RoadNode", contact: str) -> float:
     """
@@ -217,7 +236,8 @@ def _heading_into_junction(road: "RoadNode", contact: str) -> float:
     else:
         # road arrives at the junction at its end; its own forward heading
         # already points toward/into the junction.
-        return prims[-1].heading % (2 * math.pi)
+        _, _, hdg = _primitive_end_pose(prims[-1])
+        return hdg % (2 * math.pi)
 
 def _turn_angle(inc_heading: float, out_heading: float) -> float:
     """
@@ -232,7 +252,7 @@ def _turn_angle(inc_heading: float, out_heading: float) -> float:
 
 MAX_TURN_ANGLE_DEG = 150.0   # exclude near-U-turns as invalid movements
 
-def resolve_junction_lane_connections(graph: "RoadGraph") -> None:
+def resolve_junction_lane_connections(graph: "RoadGraph", is_lht: bool = False, viewer_safe: bool = False) -> None:
     """
     Must be called AFTER assign_lane_semantics() has populated
     RoadNode.lane_semantics for every road.
@@ -284,38 +304,70 @@ def resolve_junction_lane_connections(graph: "RoadGraph") -> None:
                 if n_lanes < 1:
                     continue
                 
-                # Create lane links. OpenDRIVE lanes: negative = right/forward, positive = left/backward
-                # For connecting roads, they are one-way so their lanes are -1, -2...
-                # We map incoming lanes (either negative or positive) to the connecting road (-1, -2)
-                # and then from the connecting road (-1, -2) to the outgoing lanes (negative or positive)
-                # In junction.connections, we just track the final from->to, junction_geometry handles the middleman.
+                # Determine mapping based on angle.
+                # Left turn (angle < -20) or Straight (-20 to 20): Use innermost lanes (index 0..n_lanes-1)
+                # Right turn (angle > 20): Use outermost lanes (index total_lanes-n_lanes..total_lanes-1)
+                if angle > 20: # Right turn
+                    inc_start_idx = inc_lanes - n_lanes
+                    out_start_idx = out_lanes - n_lanes
+                else:          # Left or Straight
+                    inc_start_idx = 0
+                    out_start_idx = 0
                 
-                # If incoming is forward (-1), we map -1 to connecting -1.
-                # If incoming is backward (+1), we map +1 to connecting -1.
-                # If outgoing is forward (-1), we map connecting -1 to -1.
-                # If outgoing is backward (+1), we map connecting -1 to +1.
-                
-                # Wait, LaneLink currently assumes from_lane is on inc_road, and to_lane is on out_road.
+                # Lanes are indexed 1..N. The outermost is N. The innermost is 1.
                 lane_links = []
                 for i in range(n_lanes):
-                    from_l = -(i + 1) if inc_dir == -1 else (i + 1)
-                    to_l = -(i + 1) if out_dir == -1 else (i + 1)
+                    inc_lane_abs = inc_start_idx + i + 1
+                    out_lane_abs = out_start_idx + i + 1
+                    
+                    # Forward lanes map to negative IDs, backward to positive
+                    if is_lht and not viewer_safe:
+                        from_l = inc_lane_abs if inc_dir == -1 else -inc_lane_abs
+                        to_l = out_lane_abs if out_dir == -1 else -out_lane_abs
+                    else:
+                        from_l = -inc_lane_abs if inc_dir == -1 else inc_lane_abs
+                        to_l = -out_lane_abs if out_dir == -1 else out_lane_abs
+                        
                     lane_links.append(LaneLink(from_lane=from_l, to_lane=to_l))
 
-                # Since a connecting road's reference line goes from incoming contact to outgoing contact
-                # The contact points are determined by the direction.
-                # If incoming direction is forward (-1), we connect from its "end".
-                # If incoming direction is backward (1), we connect from its "start".
-                # The contact point ON THE INCOMING ROAD where the connection starts.
-                # In JunctionConnection, we historically stored `contact_point="start"` (meaning the connecting road starts at the incoming road).
-                # Wait, OpenDRIVE connecting roads always start at the incoming road and end at the outgoing road.
+                # Calculate lateral physical offsets to properly align the connecting road
+                # The connecting road's reference line is anchored to the LEFT edge of the INNERMOST mapped lane.
+                # If inc_lanes are on the right (-), offset is negative. If on the left (+), offset is positive.
+                # offset = sign * (abs(innermost) - 1) * lane_width
+                inc_sem = graph.roads[inc_id].lane_semantics
+                out_sem = graph.roads[out_id].lane_semantics
                 
+                inc_total_lanes = (inc_sem.n_forward + inc_sem.n_backward) if inc_sem else 1
+                out_total_lanes = (out_sem.n_forward + out_sem.n_backward) if out_sem else 1
+                
+                inc_lane_width = (inc_sem.osm_width_m / inc_total_lanes) if (inc_sem and inc_sem.osm_width_m > 0) else 3.0
+                out_lane_width = (out_sem.osm_width_m / out_total_lanes) if (out_sem and out_sem.osm_width_m > 0) else 3.0
+                
+                inc_innermost_abs = inc_start_idx + 1
+                out_innermost_abs = out_start_idx + 1
+                
+                # Lateral offsets (t-coordinate) for the reference line anchoring point:
+                # OpenDRIVE defines positive t to the LEFT of the reference line, negative to the RIGHT.
+                if is_lht and not viewer_safe:
+                    # LHT forward lanes are on the left (+)
+                    inc_sign = 1 if inc_dir == -1 else -1
+                    out_sign = 1 if out_dir == -1 else -1
+                else:
+                    # RHT forward lanes are on the right (-)
+                    inc_sign = -1 if inc_dir == -1 else 1
+                    out_sign = -1 if out_dir == -1 else 1
+                    
+                inc_offset = (inc_innermost_abs - 1) * inc_lane_width * inc_sign
+                out_offset = (out_innermost_abs - 1) * out_lane_width * out_sign
+
                 junction.connections.append(
                     JunctionConnection(
                         incoming_road=inc_id,
                         connecting_road=out_id,
-                        contact_point="start", # Connecting road always connects its start to incoming
+                        contact_point="start", 
                         lane_links=lane_links,
                         turn_angle_deg=angle,
+                        inc_lateral_offset_m=inc_offset,
+                        out_lateral_offset_m=out_offset,
                     )
                 )

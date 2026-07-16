@@ -40,13 +40,20 @@ def _build_planview_xml(primitives: list) -> ET.Element:
     return pv
 
 
-def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
+def generate_xodr(graph: RoadGraph, country_code: str = "US", driving_side: str = "RHT", viewer_safe: bool = False) -> str:
     """
     Converts our RoadGraph into a scenariogeneration OpenDrive object,
     and returns the serialized XML string.
+    
+    driving_side: 'LHT' for left-hand traffic (India, UK, etc.)
+                  'RHT' for right-hand traffic (US, EU, etc.)
     """
     print(f"\n--- [Assembly] Assembling OpenDRIVE Object Model ---")
     print(f"[Assembly] Processing {len(graph.roads)} roads and {len(graph.junctions)} junctions...")
+    print(f"[Assembly] Driving side: {driving_side} (Country: {country_code})")
+    
+    is_lht = (driving_side == "LHT")
+    road_rule = xodr.TrafficRule.LHT if is_lht else xodr.TrafficRule.RHT
     
     odr = xodr.OpenDrive('Overture_OSM_Generated', revMajor='1', revMinor='6')
     
@@ -128,29 +135,48 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
             rm_solid_solid= xodr.RoadMark(xodr.RoadMarkType.solid_solid, 0.2)
 
             center_lane = xodr.Lane(lane_type=xodr.LaneType.none)
-            center_lane.add_roadmark(rm_solid_solid if n_bwd > 0 else rm_solid)
+            
+            # ── Determine Lane Type ──
+            is_rail = sem and sem.road_class in ('rail', 'narrow_gauge', 'standard_gauge')
+            lane_type = xodr.LaneType.rail if is_rail else xodr.LaneType.driving
 
+            if not is_rail:
+                center_lane.add_roadmark(rm_solid_solid if n_bwd > 0 else rm_solid)
+                
             lane_section = xodr.LaneSection(0.0, center_lane)
 
-            # Right lanes (forward direction of travel)
-            for i in range(n_fwd):
-                outer = (i == n_fwd - 1)
-                lane  = xodr.Lane(a=lane_width)
-                lane.add_roadmark(rm_solid if outer else rm_broken)
-                lane_section.add_right_lane(lane)
+            if is_lht and not viewer_safe:
+                for i in range(n_fwd):
+                    outer = (i == n_fwd - 1)
+                    lane  = xodr.Lane(a=lane_width, lane_type=lane_type)
+                    if not is_rail: lane.add_roadmark(rm_solid if outer else rm_broken)
+                    lane_section.add_left_lane(lane)
 
-            # Left lanes (opposing / backward direction)
-            for i in range(n_bwd):
-                outer = (i == n_bwd - 1)
-                lane  = xodr.Lane(a=lane_width)
-                lane.add_roadmark(rm_solid if outer else rm_broken)
-                lane_section.add_left_lane(lane)
+                for i in range(n_bwd):
+                    outer = (i == n_bwd - 1)
+                    lane  = xodr.Lane(a=lane_width, lane_type=lane_type)
+                    if not is_rail: lane.add_roadmark(rm_solid if outer else rm_broken)
+                    lane_section.add_right_lane(lane)
+            else:
+                for i in range(n_fwd):
+                    outer = (i == n_fwd - 1)
+                    lane  = xodr.Lane(a=lane_width, lane_type=lane_type)
+                    if not is_rail:
+                        lane.add_roadmark(rm_solid if outer else rm_broken)
+                    lane_section.add_right_lane(lane)
+
+                for i in range(n_bwd):
+                    outer = (i == n_bwd - 1)
+                    lane  = xodr.Lane(a=lane_width, lane_type=lane_type)
+                    if not is_rail:
+                        lane.add_roadmark(rm_solid if outer else rm_broken)
+                    lane_section.add_left_lane(lane)
 
             lanes = xodr.Lanes()
             lanes.add_lanesection(lane_section)
 
-            # Create Road
             road = xodr.Road(numeric_id, planview, lanes, name=f"Road_{road_id[:6]}")
+            road.rule = xodr.TrafficRule.RHT if viewer_safe else road_rule
             
             if road_id.startswith("junc_"):
                 parts = road_id.split("_")
@@ -235,10 +261,14 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
                             connecting_road=phys_road.id,
                             contact_point=xodr.ContactPoint.start,
                         )
-                        # The connecting road only has right lanes (-1, -2, etc)
+                        # The connecting road has right lanes (-) for RHT, or left lanes (+) for LHT
                         # So we must map the incoming lanes to those sequentially
                         for i, ll in enumerate(conn.lane_links):
-                            jconn.add_lanelink(ll.from_lane, -(i + 1))
+                            if is_lht and not viewer_safe:
+                                to_lane_id = (i + 1)
+                            else:
+                                to_lane_id = -(i + 1)
+                            jconn.add_lanelink(ll.from_lane, to_lane_id)
                         junction.add_connection(jconn)
                         
                         # Mark the physical road as belonging to this junction
@@ -340,9 +370,13 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
                     # Fix the junction attribute on the connecting road
                     conn_road_el.set('junction', str(numeric_jid))
                     
-                    # We map from connecting road lanes (-(i+1)) to outgoing road lanes (ll.to_lane)
+                    # We map from connecting road lanes (-(i+1) or +(i+1)) to outgoing road lanes (ll.to_lane)
                     for i, ll in enumerate(conn.lane_links):
-                        l_id_str = str(-(i + 1))
+                        if is_lht and not viewer_safe:
+                            conn_lane_id = (i + 1)
+                        else:
+                            conn_lane_id = -(i + 1)
+                        l_id_str = str(conn_lane_id)
                         lane_el = conn_road_el.find(f'.//lane[@id="{l_id_str}"]')
                         if lane_el is not None:
                             link_el = lane_el.find('link')
@@ -373,12 +407,18 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
                 sem = road_node.lane_semantics
                 lanes = []
                 if sem:
-                    for i in range(1, sem.n_forward + 1):
-                        lanes.append(-i)
-                    for i in range(1, sem.n_backward + 1):
-                        lanes.append(i)
+                    if is_lht and not viewer_safe:
+                        for i in range(1, sem.n_forward + 1):
+                            lanes.append(i)
+                        for i in range(1, sem.n_backward + 1):
+                            lanes.append(-i)
+                    else:
+                        for i in range(1, sem.n_forward + 1):
+                            lanes.append(-i)
+                        for i in range(1, sem.n_backward + 1):
+                            lanes.append(i)
                 else:
-                    lanes = [-1]
+                    lanes = [1] if (is_lht and not viewer_safe) else [-1]
 
                 for l_id in lanes:
                     l_id_str = str(l_id)
@@ -388,19 +428,35 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US") -> str:
                         if link_el is None:
                             link_el = ET.SubElement(lane_el, 'link')
                             
-                        if road_node.predecessor and road_node.predecessor.element_type == "road":
-                            pred_el = link_el.find('predecessor')
-                            if pred_el is None:
-                                ET.SubElement(link_el, 'predecessor', {'id': l_id_str})
-                            else:
-                                pred_el.set('id', l_id_str)
+                    # For direct connections, we only link if the adjacent road actually has this lane!
+                    if road_node.predecessor and road_node.predecessor.element_type == "road":
+                        pred_id = road_node.predecessor.element_id
+                        if pred_id in graph.roads:
+                            pred_sem = graph.roads[pred_id].lane_semantics
+                            if pred_sem:
+                                max_fwd = pred_sem.n_forward
+                                max_bwd = pred_sem.n_backward
+                                # Forward lanes are negative, backward are positive
+                                if (l_id < 0 and abs(l_id) <= max_fwd) or (l_id > 0 and abs(l_id) <= max_bwd):
+                                    pred_el = link_el.find('predecessor')
+                                    if pred_el is None:
+                                        ET.SubElement(link_el, 'predecessor', {'id': l_id_str})
+                                    else:
+                                        pred_el.set('id', l_id_str)
                                 
-                        if road_node.successor and road_node.successor.element_type == "road":
-                            succ_el = link_el.find('successor')
-                            if succ_el is None:
-                                ET.SubElement(link_el, 'successor', {'id': l_id_str})
-                            else:
-                                succ_el.set('id', l_id_str)
+                    if road_node.successor and road_node.successor.element_type == "road":
+                        succ_id = road_node.successor.element_id
+                        if succ_id in graph.roads:
+                            succ_sem = graph.roads[succ_id].lane_semantics
+                            if succ_sem:
+                                max_fwd = succ_sem.n_forward
+                                max_bwd = succ_sem.n_backward
+                                if (l_id < 0 and abs(l_id) <= max_fwd) or (l_id > 0 and abs(l_id) <= max_bwd):
+                                    succ_el = link_el.find('successor')
+                                    if succ_el is None:
+                                        ET.SubElement(link_el, 'successor', {'id': l_id_str})
+                                    else:
+                                        succ_el.set('id', l_id_str)
 
         # Re-serialize with injected planViews and laneLinks
         xml_bytes = ET.tostring(root, encoding='utf-8', xml_declaration=True)

@@ -9,6 +9,19 @@ from .topology import RoadGraph
 from .assembly import generate_xodr
 from .validation import validate_xodr
 
+# ── Comprehensive list of ISO 3166-1 alpha-2 codes for Left-Hand Traffic countries ──
+# Source: https://en.wikipedia.org/wiki/Left-_and_right-hand_traffic
+LHT_COUNTRIES = {
+    "AI", "AG", "AU", "BS", "BD", "BB", "BM", "BT", "BW", "BN",
+    "KY", "CX", "CC", "CK", "CY", "DM", "FK", "FJ", "GD", "GG",
+    "GY", "HK", "IN", "ID", "IE", "IM", "JM", "JP", "JE", "KE",
+    "KI", "LS", "MO", "MW", "MY", "MV", "MT", "MU", "MS", "MZ",
+    "NA", "NR", "NP", "NZ", "NU", "NF", "PK", "PG", "PN", "SH",
+    "KN", "LC", "VC", "WS", "SC", "SG", "SB", "ZA", "LK", "SR",
+    "SZ", "TZ", "TH", "TL", "TK", "TO", "TT", "TC", "TV", "UG",
+    "GB", "VG", "VI", "ZM", "ZW",
+}
+
 def get_country_code(lon: float, lat: float) -> str:
     """Uses Nominatim to reverse geocode the center of the bounding box to an ISO 3166-1 alpha-2 country code."""
     try:
@@ -21,6 +34,10 @@ def get_country_code(lon: float, lat: float) -> str:
     except Exception as e:
         logging.warning(f"Failed to reverse geocode country: {e}. Defaulting to 'US'.")
         return "US"
+
+def get_driving_side(country_code: str) -> str:
+    """Returns 'LHT' or 'RHT' for a given ISO country code."""
+    return "LHT" if country_code.upper() in LHT_COUNTRIES else "RHT"
 
 def run_pipeline(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float,
@@ -98,22 +115,41 @@ def run_pipeline(
         traceback.print_exc()
         raise RuntimeError(f"Phase 3 Topology/Geometry Fitting Error: {e}") from e
 
-    # --- PHASE 4: Enrich Semantic Signals ---
+    # --- PHASE 4: Enrich Semantic Signals & Resolve Topology ---
     print(f"\n[Phase 4] Aligning and projecting OSM semantic features onto backbone...")
     phase_start = time.time()
     try:
+        # Determine driving side early for topology lane resolution
+        center_lon = (min_lon + max_lon) / 2.0
+        center_lat = (min_lat + max_lat) / 2.0
+        country_code = get_country_code(center_lon, center_lat)
+        driving_side = get_driving_side(country_code)
+        is_lht = (driving_side == "LHT")
+        print(f"[Phase 4] Detected driving side: {driving_side} (Country: {country_code})")
+        
         from .enrichment import assign_signals_to_roads, assign_lane_semantics
         assign_signals_to_roads(osm_anchored['nodes'], graph.roads, overture_anchored['segments'])
         assign_lane_semantics(osm_anchored['ways'], graph.roads, overture_anchored['segments'])
         
         from .topology import resolve_junction_lane_connections
-        resolve_junction_lane_connections(graph)
-        
         from .junction_geometry import build_junction_connecting_roads
+        import copy
+        
+        # Deepcopy the graph before modifying junctions and lanes so we can generate both versions
+        global graph_viewer
+        graph_viewer = copy.deepcopy(graph)
+        
+        # 1. Simulator-safe (Strict OpenDRIVE LHT)
+        resolve_junction_lane_connections(graph, is_lht=is_lht, viewer_safe=False)
         connecting_roads = build_junction_connecting_roads(graph)
         graph.roads.update(connecting_roads)
         
-        print(f"[Phase 4] Semantic enrichment and lane resolution completed in {time.time() - phase_start:.2f} seconds.")
+        # 2. Viewer-safe (Hacked RHT for odrviewer)
+        resolve_junction_lane_connections(graph_viewer, is_lht=is_lht, viewer_safe=True)
+        connecting_roads_v = build_junction_connecting_roads(graph_viewer)
+        graph_viewer.roads.update(connecting_roads_v)
+        
+        print(f"[Phase 4] Semantic enrichment and dual lane resolution completed in {time.time() - phase_start:.2f} seconds.")
     except Exception as e:
         print(f"\n[ERROR] Pipeline failed in Phase 4 (Semantic Enrichment): {e}")
         traceback.print_exc()
@@ -123,13 +159,14 @@ def run_pipeline(
     print(f"\n[Phase 5] Compiling RoadGraph to ASAM OpenDRIVE object model...")
     phase_start = time.time()
     try:
-        center_lon = (min_lon + max_lon) / 2.0
-        center_lat = (min_lat + max_lat) / 2.0
-        country_code = get_country_code(center_lon, center_lat)
+        print(f"[Phase 5] Generating Simulator OpenDRIVE XML (Country: {country_code}, Driving Side: {driving_side}, Viewer Safe: False)...")
+        xodr_xml_string = generate_xodr(graph, country_code=country_code, driving_side=driving_side, viewer_safe=False)
         
-        print(f"[Phase 5] Generating OpenDRIVE XML (Country Code: {country_code})...")
-        xodr_xml_string = generate_xodr(graph, country_code=country_code)
-        print(f"[Phase 5] Compilation and serialization completed in {time.time() - phase_start:.2f} seconds.")
+        print(f"[Phase 5] Generating Viewer-Safe OpenDRIVE XML (Country: {country_code}, Driving Side: {driving_side}, Viewer Safe: True)...")
+        global xodr_xml_string_viewer
+        xodr_xml_string_viewer = generate_xodr(graph_viewer, country_code=country_code, driving_side=driving_side, viewer_safe=True)
+        
+        print(f"[Phase 5] Dual compilation and serialization completed in {time.time() - phase_start:.2f} seconds.")
     except Exception as e:
         print(f"\n[ERROR] Pipeline failed in Phase 5 (OpenDRIVE Compilation): {e}")
         traceback.print_exc()
@@ -142,14 +179,22 @@ def run_pipeline(
         # Write to disk first so qc_opendrive can read it directly
         if output_path:
             import os
+            base, ext = os.path.splitext(output_path)
+            viewer_path = f"{base}_viewer{ext}"
+            
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(xodr_xml_string)
-            print(f"[Phase 6] Wrote XODR to {output_path} for QC validation.")
+            with open(viewer_path, "w", encoding="utf-8") as f:
+                f.write(xodr_xml_string_viewer)
+                
+            print(f"[Phase 6] Wrote XODR to {output_path} and {viewer_path} for QC validation.")
             validate_xodr(xodr_xml_string, xodr_file_path=output_path)
+            validate_xodr(xodr_xml_string_viewer, xodr_file_path=viewer_path)
         else:
             validate_xodr(xodr_xml_string)
-        print(f"[Phase 6] Validation completed in {time.time() - phase_start:.2f} seconds.")
+            validate_xodr(xodr_xml_string_viewer)
+        print(f"[Phase 6] Dual validation completed in {time.time() - phase_start:.2f} seconds.")
     except Exception as e:
         print(f"\n[ERROR] Pipeline failed in Phase 6 (QC Validation): {e}")
         traceback.print_exc()
