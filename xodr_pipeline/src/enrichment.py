@@ -161,20 +161,29 @@ def assign_lane_semantics(
         "residential":"residential","living_street":"residential",
         "service":"service","track":"track","path":"path",
         "unclassified":"residential",
+        "rail":"rail", "narrow_gauge":"rail", "standard_gauge":"rail", "light_rail":"rail"
     }
     SKIP_HIGHWAY = {"footway","cycleway","path","steps","pedestrian","construction","proposed"}
 
     # ── Phase A: Build class → best LaneSemantics from OSM ways ───────────────
     class_semantics: Dict[str, "LaneSemantics"] = {}
+    way_semantics: Dict[int, "LaneSemantics"] = {}
 
     for way_id, way in osm_ways.items():
         try:
             tags = way.tags
             highway = tags.get("highway", "")
-            if not highway or highway in SKIP_HIGHWAY:
+            railway = tags.get("railway", "")
+            
+            if not highway and not railway:
+                continue
+            if highway in SKIP_HIGHWAY:
                 continue
 
-            ov_class = HIGHWAY_TO_CLASS.get(highway, "residential")
+            if railway:
+                ov_class = "rail"
+            else:
+                ov_class = HIGHWAY_TO_CLASS.get(highway, "residential")
 
             # Parse OSM width
             osm_width_m = 0.0
@@ -189,7 +198,12 @@ def assign_lane_semantics(
                 except (ValueError, TypeError):
                     osm_width_m = 0.0
 
-            is_oneway = tags.get("oneway", "no") in ("yes", "1", "true", "-1")
+            oneway_tag = tags.get("oneway", "no").lower()
+            if highway in ("motorway", "motorway_link", "trunk", "trunk_link"):
+                is_oneway = oneway_tag not in ("no", "false", "0")
+            else:
+                is_oneway = oneway_tag in ("yes", "1", "true", "-1", "reverse")
+                
             total_lanes   = _safe_int(tags.get("lanes"), 0)
             forward_lanes = _safe_int(tags.get("lanes:forward"), 0)
             backward_lanes= _safe_int(tags.get("lanes:backward"), 0)
@@ -226,33 +240,52 @@ def assign_lane_semantics(
                 turn_rules=turn_rules,
                 n_forward=forward_lanes, n_backward=backward_lanes,
                 is_oneway=is_oneway, osm_width_m=osm_width_m,
+                road_class=ov_class
             )
 
-            # Keep the richer entry (more total lanes wins)
-            existing = class_semantics.get(ov_class)
-            if existing is None or (forward_lanes + backward_lanes) > (existing.n_forward + existing.n_backward):
-                class_semantics[ov_class] = sem
+            way_semantics[way_id] = sem
         except Exception as e:
             print(f"[Enrichment] Warning: Failed to extract lane semantics for way '{way_id}': {e}")
 
     print(f"[Enrichment] Phase A: Formulated lane lookup profiles for {len(class_semantics)} road classes.")
 
-    # ── Phase B: Apply class lookup to Overture segments ──────────────────────
+    # ── Phase B: Apply OSM and class lookup to Overture segments ────────────────
     matched_from_osm = 0
     for seg_id, seg in overture_segments.items():
         if seg_id not in roads:
             continue
-        seg_class = (seg.road_class or "residential").lower()
+            
+        osm_way_id = None
+        for src in seg.sources:
+            if src.get('dataset') == 'OpenStreetMap':
+                rec_id = src.get('record_id', '')
+                if rec_id.startswith('way/'):
+                    try:
+                        osm_way_id = int(rec_id.split('/')[1])
+                        break
+                    except: pass
+                elif rec_id.startswith('w'):
+                    try:
+                        osm_way_id = int(rec_id[1:].split('@')[0])
+                        break
+                    except: pass
 
         matched_sem = None
-        for key, sem in class_semantics.items():
-            if key in seg_class:
-                matched_sem = sem
-                break
+        if osm_way_id is not None and osm_way_id in way_semantics:
+            matched_sem = way_semantics[osm_way_id]
+            
+        if matched_sem is None:
+            seg_class = (seg.road_class or "residential").lower()
+            for key, sem in class_semantics.items():
+                if key in seg_class:
+                    matched_sem = sem
+                    break
 
         if matched_sem is not None:
             roads[seg_id].lane_semantics = matched_sem
             matched_from_osm += 1
+            
+
 
     print(f"[Enrichment] Phase B: Matched {matched_from_osm} Overture segments with OSM profiles.")
 
@@ -277,8 +310,40 @@ def assign_lane_semantics(
             turn_rules=["through"] * fwd,
             n_forward=fwd, n_backward=bwd,
             is_oneway=(bwd == 0), osm_width_m=0.0,
+            road_class=road_class
         )
         fallback_count += 1
 
     print(f"[Enrichment] Phase C: Set default fallback semantics on {fallback_count} segments.")
+    
+    # ── Phase D: Dual Carriageway Detection & Enforcement ─────────────────────
+    # Strategy 1: Class-based — motorways and trunks are always one-way
+    # Strategy 2: Geometric — detect near-parallel, opposite-heading segment pairs
+    # Strategy 3: Overture road_flags — check for divided/link indicators
+    
+    forced_oneway_count = 0
+    
+    # Strategy 1: Class-based enforcement (motorway/trunk always one-way)
+    for seg_id, seg in overture_segments.items():
+        if seg_id not in roads:
+            continue
+        if seg.road_class in ["motorway", "trunk", "motorway_link", "trunk_link"]:
+            ls = roads[seg_id].lane_semantics
+            if ls and ls.n_backward > 0:
+                roads[seg_id].lane_semantics = LaneSemantics(
+                    turn_rules=["through"] * ls.n_forward,
+                    n_forward=ls.n_forward,
+                    n_backward=0,
+                    is_oneway=True,
+                    osm_width_m=ls.osm_width_m,
+                    road_class=ls.road_class
+                )
+                forced_oneway_count += 1
+    
+    print(f"[Enrichment] Phase D (Strategy 1): Forced {forced_oneway_count} motorway/trunk segments to one-way.")
+    
+
+    
+
     print(f"[Enrichment] Lane semantics assignment complete.")
+
