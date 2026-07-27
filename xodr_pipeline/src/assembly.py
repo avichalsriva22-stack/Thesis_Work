@@ -436,8 +436,12 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US", driving_side: str 
                             if pred_sem:
                                 max_fwd = pred_sem.n_forward
                                 max_bwd = pred_sem.n_backward
-                                # Forward lanes are negative, backward are positive
-                                if (l_id < 0 and abs(l_id) <= max_fwd) or (l_id > 0 and abs(l_id) <= max_bwd):
+                                if is_lht and not viewer_safe:
+                                    valid_lane = (l_id > 0 and abs(l_id) <= max_fwd) or (l_id < 0 and abs(l_id) <= max_bwd)
+                                else:
+                                    valid_lane = (l_id < 0 and abs(l_id) <= max_fwd) or (l_id > 0 and abs(l_id) <= max_bwd)
+                                    
+                                if valid_lane:
                                     pred_el = link_el.find('predecessor')
                                     if pred_el is None:
                                         ET.SubElement(link_el, 'predecessor', {'id': l_id_str})
@@ -451,7 +455,12 @@ def generate_xodr(graph: RoadGraph, country_code: str = "US", driving_side: str 
                             if succ_sem:
                                 max_fwd = succ_sem.n_forward
                                 max_bwd = succ_sem.n_backward
-                                if (l_id < 0 and abs(l_id) <= max_fwd) or (l_id > 0 and abs(l_id) <= max_bwd):
+                                if is_lht and not viewer_safe:
+                                    valid_lane = (l_id > 0 and abs(l_id) <= max_fwd) or (l_id < 0 and abs(l_id) <= max_bwd)
+                                else:
+                                    valid_lane = (l_id < 0 and abs(l_id) <= max_fwd) or (l_id > 0 and abs(l_id) <= max_bwd)
+                                    
+                                if valid_lane:
                                     succ_el = link_el.find('successor')
                                     if succ_el is None:
                                         ET.SubElement(link_el, 'successor', {'id': l_id_str})

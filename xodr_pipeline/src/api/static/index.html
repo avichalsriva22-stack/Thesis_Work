@@ -66,6 +66,12 @@
         }
         
         .download-btn:hover { background: #27ae60; }
+        
+        .viewer-btn {
+            background: #e67e22;
+            margin-top: 10px;
+        }
+        .viewer-btn:hover { background: #d35400; }
     </style>
 </head>
 <body>
@@ -77,7 +83,8 @@
         <p>1. Click the rectangle tool on the left.<br>2. Draw a bounding box over an intersection.</p>
         <div id="loading" class="loading-spinner"></div>
         <div id="status">Waiting for input...</div>
-        <a id="downloadBtn" class="download-btn" download="result.xodr">Download .xodr</a>
+        <a id="downloadBtn" class="download-btn" download="result.xodr">Download Simulator .xodr</a>
+        <a id="downloadViewerBtn" class="download-btn viewer-btn" href="/download/generated_viewer.xodr" download="generated_viewer.xodr">Download Viewer-Safe .xodr</a>
     </div>
 
     <script>
@@ -127,6 +134,7 @@
         async function triggerPipeline(bbox) {
             document.getElementById('loading').style.display = 'block';
             document.getElementById('downloadBtn').style.display = 'none';
+            document.getElementById('downloadViewerBtn').style.display = 'none';
             document.getElementById('status').style.color = "#3498db";
             document.getElementById('status').innerText = "Processing pipeline...";
 
@@ -165,6 +173,9 @@
                 const btn = document.getElementById('downloadBtn');
                 btn.href = url;
                 btn.style.display = 'block';
+                
+                const btnViewer = document.getElementById('downloadViewerBtn');
+                btnViewer.style.display = 'block';
                 
                 document.getElementById('loading').style.display = 'none';
                 document.getElementById('status').innerText = "Success! OpenDRIVE generated.";

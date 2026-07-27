@@ -37,12 +37,20 @@ def fetch_osm_data(bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
     min_lon, min_lat, max_lon, max_lat = bbox
     
     # Overpass bounding box is (min_lat, min_lon, max_lat, max_lon)
-    # Filter ways to only pull drivable highway classes (excluding footways, railways, etc.)
+    # Filter ways to only pull drivable, ground-level highway classes.
+    # Explicitly EXCLUDE:
+    #   - Non-drivable types (footway, cycleway, path, steps, pedestrian)
+    #   - Ways with bridge, tunnel, or non-zero layer tags (elevated/underground structures)
     query = f"""
     [out:json][timeout:25];
     (
       node({min_lat},{min_lon},{max_lat},{max_lon});
-      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified|service|living_street|unknown)$"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way
+        ["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified|service|living_street|unknown)$"]
+        [!"bridge"]
+        [!"tunnel"]
+        ["layer"!~"^-|[1-9]"]
+        ({min_lat},{min_lon},{max_lat},{max_lon});
     );
     out body;
     """
@@ -82,7 +90,8 @@ def fetch_osm_data(bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
     
     nodes = []
     ways = []
-    
+    skipped_ways = 0
+
     elements = result.get('elements', [])
     for element in elements:
         if element['type'] == 'node':
@@ -93,13 +102,30 @@ def fetch_osm_data(bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
                 "tags": element.get('tags', {})
             })
         elif element['type'] == 'way':
+            tags = element.get('tags', {})
+
+            # Secondary guard: skip any elevated/underground ways that slipped
+            # through the Overpass filter (bridge, tunnel, layer != 0).
+            layer_str = tags.get('layer', '0')
+            try:
+                layer_val = int(layer_str)
+            except (ValueError, TypeError):
+                layer_val = 0
+
+            bridge  = tags.get('bridge', 'no')
+            tunnel  = tags.get('tunnel', 'no')
+            
+            if layer_val != 0 or bridge not in ('no', '') or tunnel not in ('no', ''):
+                skipped_ways += 1
+                continue  # skip elevated / underground ways
+
             ways.append({
                 "id": str(element['id']),
                 "nodes": [str(n) for n in element.get('nodes', [])],
-                "tags": element.get('tags', {})
+                "tags": tags
             })
-        
-    print(f"[Ingestion] Parsed {len(nodes)} nodes and {len(ways)} ways from OSM data.")
+
+    print(f"[Ingestion] Parsed {len(nodes)} nodes and {len(ways)} ways from OSM data ({skipped_ways} elevated/underground ways skipped).")
     return {
         "nodes": nodes,
         "ways": ways
@@ -124,7 +150,15 @@ def fetch_overture_data(bbox: Tuple[float, float, float, float]) -> Dict[str, An
         
     ALLOWED_ROAD_CLASSES = {
         'motorway', 'trunk', 'primary', 'secondary', 'tertiary',
-        'residential', 'unclassified', 'service', 'living_street', 'unknown'
+        'residential', 'unclassified', 'service', 'living_street', 'unknown',
+        'rail', 'narrow_gauge', 'standard_gauge'
+    }
+    # Any segment whose class falls into these values is rail/transit and must
+    # never be generated as a drivable OpenDRIVE road.
+    BLOCKED_ROAD_CLASSES = {
+        'subway', 'light_rail', 'tram', 'monorail', 'funicular',
+        'aerialway', 'cable_car', 'gondola', 'chair_lift', 'drag_lift',
+        'ferry', 'aeroway'
     }
 
     segments = []
@@ -136,10 +170,54 @@ def fetch_overture_data(bbox: Tuple[float, float, float, float]) -> Dict[str, An
                     if geom:
                         try:
                             # ── Semantic Filter: only keep drivable road classes ──
-                            road_class = row.get('class')
+                            road_class  = row.get('class')
+                            subtype     = row.get('subtype', 'road')
+                            level_rules = row.get('level_rules') or []
+                            road_flags  = row.get('road_flags')  or []
+
+                            # Layer 1: reject any non-road and non-track subtypes outright
+                            if subtype and subtype not in ('road', 'track', 'rail'):
+                                continue
+
+                            # Layer 2: reject explicitly blocked non-road classes
+                            if road_class in BLOCKED_ROAD_CLASSES:
+                                continue
+
+                            # Layer 3: require class to be in the drivable allowlist
                             if road_class not in ALLOWED_ROAD_CLASSES:
                                 continue
-                                
+
+                            # Layer 4: reject elevated structures (viaducts/bridges).
+                            # Overture encodes vertical position in `level_rules` where
+                            # value > 0 means above ground.  `road_flags` may carry
+                            # an `is_bridge` / `is_tunnel` flag dict.
+                            is_elevated = False
+                            for lr in level_rules:
+                                try:
+                                    lvl = lr.get('value', 0) if isinstance(lr, dict) else 0
+                                    if lvl > 0:
+                                        is_elevated = True
+                                        break
+                                except Exception:
+                                    pass
+                            if not is_elevated:
+                                for rf in road_flags:
+                                    try:
+                                        if isinstance(rf, dict) and rf.get('values'):
+                                            for v in (rf.get('values') or []):
+                                                if str(v).lower() in ('is_bridge', 'bridge',
+                                                                       'viaduct', 'is_elevated'):
+                                                    is_elevated = True
+                                                    break
+                                    except Exception:
+                                        pass
+                                    if is_elevated:
+                                        break
+                            if is_elevated:
+                                print(f"[Ingestion] Skipping elevated segment {row.get('id','')} "
+                                      f"(class={road_class}, level_rules={level_rules}, flags={road_flags})")
+                                continue
+
                             ls = shapely.wkb.loads(geom)
                             if ls.geom_type == 'LineString':
                                 coords = list(ls.coords)
@@ -150,6 +228,8 @@ def fetch_overture_data(bbox: Tuple[float, float, float, float]) -> Dict[str, An
                                     "width_rules": row.get('width_rules', []),
                                     "class": row.get('class'),
                                     "subclass": row.get('subclass'),
+                                    "level_rules": level_rules,
+                                    "road_flags": road_flags,
                                     "sources": row.get('sources', [])
                                 })
                         except Exception as parse_err:

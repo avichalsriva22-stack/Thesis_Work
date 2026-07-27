@@ -23,6 +23,7 @@ class AnchoredOvertureSegment:
     road_class: Optional[str] = None
     subclass: Optional[str] = None
     sources: List[Dict[str, str]] = field(default_factory=list)
+    road_flags: List[Any] = field(default_factory=list)
 
 @dataclass
 class AnchoredOSMNode:
@@ -86,6 +87,7 @@ class LaneSemantics:
     n_backward: int = 0           # Lanes in backward/opposing direction (left side)
     is_oneway: bool = False       # True if OSM oneway=yes
     osm_width_m: float = 0.0     # Width in metres from OSM width= tag (0 = unknown)
+    road_class: str = "residential" # e.g. 'rail', 'motorway'
 
 @dataclass
 class PlanViewGeometry:
@@ -122,6 +124,8 @@ class JunctionConnection:
     lane_links: List["LaneLink"] = field(default_factory=list)
     turn_angle_deg: float = 0.0
     physical_road_id: Optional[str] = None
+    inc_lateral_offset_m: float = 0.0
+    out_lateral_offset_m: float = 0.0
 
 @dataclass
 class JunctionNode:

@@ -109,6 +109,9 @@ def run_pipeline(
         overture_anchored['segments'] = split_segments_at_connectors(overture_anchored['segments'])
         
         graph = build_topology(overture_anchored['segments'], overture_anchored['connectors'])
+        
+        pass
+        
         print(f"[Phase 3] Topology & geometry fit completed in {time.time() - phase_start:.2f} seconds.")
     except Exception as e:
         print(f"\n[ERROR] Pipeline failed in Phase 3 (Topology/Geometry Fitting): {e}")

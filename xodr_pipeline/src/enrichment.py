@@ -173,17 +173,13 @@ def assign_lane_semantics(
         try:
             tags = way.tags
             highway = tags.get("highway", "")
-            railway = tags.get("railway", "")
             
-            if not highway and not railway:
+            if not highway:
                 continue
             if highway in SKIP_HIGHWAY:
                 continue
 
-            if railway:
-                ov_class = "rail"
-            else:
-                ov_class = HIGHWAY_TO_CLASS.get(highway, "residential")
+            ov_class = HIGHWAY_TO_CLASS.get(highway, "residential")
 
             # Parse OSM width
             osm_width_m = 0.0

@@ -120,7 +120,8 @@ class CoordinateAnchor:
                     subtype=seg.get('subtype'),
                     road_class=seg.get('class'),
                     subclass=seg.get('subclass'),
-                    sources=seg.get('sources', [])
+                    sources=seg.get('sources', []),
+                    road_flags=seg.get('road_flags', [])
                 )
             except Exception as e:
                 print(f"[Anchoring] Warning: Failed to anchor segment {seg.get('id', 'unknown')}: {e}")
